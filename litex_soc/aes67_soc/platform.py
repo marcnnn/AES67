@@ -11,6 +11,7 @@ from litex.build.generic_platform import Pins, Subsignal, IOStandard
 from litex.build.altera import AlteraPlatform
 from litex.build.gowin.platform import GowinPlatform
 from litex.build.lattice import LatticePlatform
+from litex.build.xilinx import XilinxPlatform
 
 
 # -- Shared I/O: everything except clock and main RAM (identical across targets) --
@@ -446,6 +447,63 @@ class BridgeLatticeStubPlatform(LatticePlatform):
 
     def __init__(self):
         LatticePlatform.__init__(self, _LATTICE_STUB_DEVICE, _io_bridge, toolchain="diamond")
+
+    def create_programmer(self):
+        raise NotImplementedError
+
+    def build(self, fragment, **kwargs):
+        return _stub_build(self, fragment, **kwargs)
+
+
+# -- Xilinx (UltraScale+ / Vivado) stub platforms ------------------------------
+#
+# Same idea as the Lattice stubs: only the reset-synchroniser primitive differs
+# (LiteX lowers AsyncResetSynchronizer to FDPE/FDCE cells for Xilinx). Used for
+# the PCIe-hosted AES67 card (FPGA/boards/xilinx/alibaba_ku3p), where the board
+# top drives the aes67_bridge over a PCIe -> AXI -> Wishbone path instead of a
+# LiteX-generated master, so only the aes67_bridge target is really needed; the
+# spibone/uartbone variants exist for completeness (bring-up over a debug
+# header).
+_XILINX_STUB_DEVICE = "xcku3p-ffvb676-1-e"
+
+
+class SpiboneXilinxStubPlatform(XilinxPlatform):
+    """Xilinx/Vivado counterpart of :class:`SpiboneStubPlatform`."""
+    default_clk_name   = "clk_sys"
+    default_clk_period = 1e9 / 75e6
+
+    def __init__(self):
+        XilinxPlatform.__init__(self, _XILINX_STUB_DEVICE, _io_spibone, toolchain="vivado")
+
+    def create_programmer(self):
+        raise NotImplementedError
+
+    def build(self, fragment, **kwargs):
+        return _stub_build(self, fragment, **kwargs)
+
+
+class UartboneXilinxStubPlatform(XilinxPlatform):
+    """Xilinx/Vivado counterpart of :class:`UartboneStubPlatform`."""
+    default_clk_name   = "clk_sys"
+    default_clk_period = 1e9 / 75e6
+
+    def __init__(self):
+        XilinxPlatform.__init__(self, _XILINX_STUB_DEVICE, _io_uartbone, toolchain="vivado")
+
+    def create_programmer(self):
+        raise NotImplementedError
+
+    def build(self, fragment, **kwargs):
+        return _stub_build(self, fragment, **kwargs)
+
+
+class BridgeXilinxStubPlatform(XilinxPlatform):
+    """Xilinx/Vivado counterpart of :class:`BridgeStubPlatform`."""
+    default_clk_name   = "clk_sys"
+    default_clk_period = 1e9 / 75e6
+
+    def __init__(self):
+        XilinxPlatform.__init__(self, _XILINX_STUB_DEVICE, _io_bridge, toolchain="vivado")
 
     def create_programmer(self):
         raise NotImplementedError

@@ -117,7 +117,13 @@ architecture rtl of ethernet_top is
     SIGNAL is_rtp_pkt_tog_done : STD_LOGIC;
     
 begin
-  mac_speed_override <= SPEED_100MBPS WHEN MII_TYPE = RMII OR MII_TYPE = MII else SPEED_UNSPECIFIED;
+  -- RMII/MII PHYs are fixed at 100 Mbit. A GMII link to an on-chip PCS/PMA
+  -- (1000BASE-X/SGMII over SFP) is always gigabit and the PCS's MDIO status
+  -- registers carry no 1000BASE-T ability bits for the MIIM speed detection,
+  -- so force 1 Gbit there too. RGMII PHYs report their speed over MIIM.
+  mac_speed_override <= SPEED_100MBPS WHEN MII_TYPE = RMII OR MII_TYPE = MII
+                   else SPEED_1000MBPS WHEN MII_TYPE = GMII
+                   else SPEED_UNSPECIFIED;
   is_rtp_pkt_tog_o <= is_rtp_pkt_tog_done when mac_speed = b"01" else is_rtp_pkt_tog_receive;
   is_mcu_pkt_tog_o <= is_mcu_pkt_tog_done when mac_speed = b"01" else is_mcu_pkt_tog_receive;
 

@@ -9,7 +9,9 @@ package system_cfg_pkg is
     constant USE_EXTERNAL_PLL : boolean := false;
     type t_mii_types is (MII, RMII, GMII, RGMII);
     type t_phy_names is (LAN8720A, LXT973, CORTINA, OTHER);
-    type t_soc_types is (LITEX_SPIBONE, LITEX_VEXRISCV_HRAM, LITEX_VEXRISCV_SDRAM, LITEX_UARTBONE);
+    -- PCIE_BRIDGE: no LiteX master inside soc_top; the board top drives the
+    -- aes67_wb bus itself (PCIe -> AXI -> Wishbone, see FPGA/pcie/).
+    type t_soc_types is (LITEX_SPIBONE, LITEX_VEXRISCV_HRAM, LITEX_VEXRISCV_SDRAM, LITEX_UARTBONE, PCIE_BRIDGE);
     type t_platforms is (ALTERA, GOWIN, LATTICE, XILINX);
     function platform_to_string (platform : in t_platforms) return string;
     
@@ -74,6 +76,14 @@ package system_cfg_pkg is
         MII_CLK_NS_PER_TICK => 8,
         MIIM_CLOCK_DIVIDER => 125
     );
+    -- GMII straight from an on-chip PCS/PMA (1000BASE-X / SGMII over an SFP
+    -- cage): 8-bit data at 125 MHz, MDIO to the PCS management registers.
+    constant std_gmii_cfg : t_network_config := (
+        MII_TYPE => GMII,
+        MII_WIDTH => 8,
+        MII_CLK_NS_PER_TICK => 8,
+        MIIM_CLOCK_DIVIDER => 50
+    );
     constant std_lxt_cfg : t_phy_config := (
         PHY_TYPE => LXT973,
         MIIM_PHY_ADDRESS => "00010",
@@ -88,6 +98,13 @@ package system_cfg_pkg is
         PHY_TYPE => CORTINA,
         MIIM_PHY_ADDRESS => "00000",
         NETWORK_CONFIG => std_rgmii_cfg
+    );
+    -- Xilinx 1G/2.5G Ethernet PCS/PMA core behind an SFP cage. The core's
+    -- MDIO PHY address is set by its phyaddr port (board top drives 1).
+    constant std_sfp_pcs_cfg : t_phy_config := (
+        PHY_TYPE => OTHER,
+        MIIM_PHY_ADDRESS => "00001",
+        NETWORK_CONFIG => std_gmii_cfg
     );
 
 
@@ -133,6 +150,31 @@ package system_cfg_pkg is
         CHANNELS => 2,
         TDM_PINS => 1,
         ADDA_CFG => i2s_lj_dac_config
+    );
+
+    -- Parallel (register) audio interface for a host DMA engine: no TDM pins,
+    -- the board top presents/consumes one full frame per fs tick.
+    constant pcie_parallel_outputs : t_audio_cfg := (
+        MAX_STREAMS => 8,
+        BUFFER_DEPTH => 256,
+        CHANNELS => 32,
+        TDM_PINS => 1,
+        ADDA_CFG => tdm8_dac_config
+    );
+    constant pcie_parallel_inputs : t_audio_cfg := (
+        MAX_STREAMS => 8,
+        BUFFER_DEPTH => 64,
+        CHANNELS => 32,
+        TDM_PINS => 1,
+        ADDA_CFG => tdm8_adc_config
+    );
+    constant audio_config_pcie : t_global_audio_cfg := (
+        MCLK_SPEED => audio_clock_24_57,
+        BCLK_SPEED => audio_clock_12_28,
+        USE_PARALLEL_INTERFACE => true,
+        PARALLEL_BYTE_DEPTH => 3,
+        RX_DA_CFG => pcie_parallel_outputs,
+        TX_AD_CFG => pcie_parallel_inputs
     );
 
     constant audio_config_lo : t_global_audio_cfg := (
@@ -188,6 +230,21 @@ package system_cfg_pkg is
         PLATFORM => ALTERA,
         PHY_CONFIG => std_lan8720a_cfg,
         AUDIO_CONFIG => audio_config_cyc,
+        STATIC_PTP_CONFIG => true,
+        PTP_IN_SOFTWARE => true,
+        ENABLE_METERING => false,
+        PTP_MOVING_AVERAGE_DEPTH => 4
+    );
+
+    -- Alibaba Cloud AS02MC04 (XCKU3P-FFVB676) PCIe card: 100 MHz LVDS
+    -- oscillator, SFP28 cage via the Xilinx PCS/PMA (GMII), PCIe host as the
+    -- control plane (software PTP via ptp4l) and host-DMA audio.
+    constant global_system_cfg_alibaba_ku3p : t_global_system_cfg := (
+        CLK_IN_SPEED => 100,
+        SOC_TYPE => PCIE_BRIDGE,
+        PLATFORM => XILINX,
+        PHY_CONFIG => std_sfp_pcs_cfg,
+        AUDIO_CONFIG => audio_config_pcie,
         STATIC_PTP_CONFIG => true,
         PTP_IN_SOFTWARE => true,
         ENABLE_METERING => false,

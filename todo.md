@@ -27,3 +27,9 @@
 
   - Linux Binary zur Konfiguration per SPI
   - Option: Sample Buffer auf externen RAM
+
+## PCIe Karte (Alibaba AS02MC04 / XCKU3P)
+
+  - Erster Vivado-Build: Portlisten der xdma_0 / gig_eth_pcs_pma_0 Components gegen die generierten IP-Templates prüfen
+  - PCIe Link-Training (Lane Reversal, PERST A9 vs T19) und PCS/PMA-Link am SFP testen
+  - Audio-DMA-Engine mit aplay/arecord verifizieren (Pointer/Period-IRQs, Under-/Overrun-Zähler)

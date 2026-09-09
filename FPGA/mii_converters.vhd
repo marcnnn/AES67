@@ -164,6 +164,24 @@ begin
         c1     => enet_clk_90
       );
   end generate;
+  -- GMII pass-through: the PHY side is already an 8-bit GMII bus running at
+  -- 125 MHz (e.g. the Xilinx 1G/2.5G PCS/PMA core behind an SFP cage). Both
+  -- directions are clocked by the single PCS-provided userclk2, which the
+  -- board top feeds into phy_mii_enet_tx_clk_i (TX) and phy_mii_enet_rx_clk
+  -- (RX). Nothing to convert, just fan the clocks/data out to the MAC and the
+  -- timestamping unit.
+  gmiigen : if (MII_TYPE = GMII and MII_WIDTH = 8) generate
+    mii_tx_clock_o <= phy_mii_enet_tx_clk_i;
+    mii_rx_clock_o <= phy_mii_enet_rx_clk;
+    mii_rx_dv_o    <= phy_mii_enet_rx_dv;
+    mii_rx_err_o   <= phy_mii_enet_rx_err;
+    mii_rxd_o      <= phy_mii_enet_rx_d;
+    phy_mii_enet_tx_d   <= mii_txd_i;
+    phy_mii_enet_tx_en  <= mii_tx_en_i;
+    phy_mii_enet_tx_clk <= phy_mii_enet_tx_clk_i;
+    phy_clk_tx_o <= phy_mii_enet_tx_clk_i;
+    phy_clk_rx_o <= phy_mii_enet_rx_clk;
+  end generate;
   miigen : if (MII_TYPE = MII and MII_WIDTH = 4) generate
     mii_tx_clock_o <= phy_mii_enet_tx_clk_i;
     mii_rx_clock_o <= phy_mii_enet_rx_clk;

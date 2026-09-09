@@ -177,7 +177,7 @@ int aes67_phc_register(struct aes67_priv *p)
 	};
 	scnprintf(p->ptp_info.name, sizeof(p->ptp_info.name), "aes67_wallclock");
 
-	p->ptp_clock = ptp_clock_register(&p->ptp_info, &p->spi->dev);
+	p->ptp_clock = ptp_clock_register(&p->ptp_info, p->dev);
 	if (IS_ERR(p->ptp_clock)) {
 		int ret = PTR_ERR(p->ptp_clock);
 

@@ -1,13 +1,21 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * AES67 FPGA Ethernet + PHC driver — shared definitions.
+ * AES67 FPGA Ethernet + PHC (+ ALSA) driver — shared definitions.
  *
- * The FPGA (CPU-less aes67_bridge target, built with --ptp-in-software) hangs
- * off an SPI link via the LiteX spibone Wishbone bridge. This driver is the sole
- * Wishbone master: it carries the eth_buf control-plane datapath as a netdev,
- * exposes the FPGA wallclock as a PHC, and hardware-timestamps PTP frames so
- * stock ptp4l can discipline the clock. Config traffic from userspace rides the
- * same bus through /dev/aes67ctl (see aes67_uapi.h).
+ * The FPGA (CPU-less aes67_bridge target, built with PTP_IN_SOFTWARE) is
+ * reached over one of two buses, both ending in the same LiteX Wishbone
+ * register window:
+ *
+ *   spibone : SPI link (Raspberry Pi + external FPGA board). Every access is
+ *             an SPI transfer that sleeps.
+ *   pcie    : the FPGA is a PCIe card (Alibaba KU3P); the window is memory
+ *             mapped in BAR0 and the card also carries a bus-mastering audio
+ *             DMA engine that becomes an ALSA card.
+ *
+ * This driver is the sole Wishbone master either way: it carries the eth_buf
+ * control-plane datapath as a netdev, exposes the FPGA wallclock as a PHC,
+ * and hardware-timestamps PTP frames so stock ptp4l can discipline the clock.
+ * Config traffic from userspace rides the same bus through /dev/aes67ctl.
  */
 #ifndef AES67_ETH_H
 #define AES67_ETH_H
@@ -59,30 +67,51 @@
 #define AES67_BURST_WR_CHUNK   256u   /* 7 + 4*256 + 8  = 1039 B */
 #define AES67_BURST_RD_CHUNK   240u   /* 7 + 7*240 + 16 = 1703 B */
 
+struct aes67_priv;
+
+/* --- Bus backend ---------------------------------------------------------- *
+ * All ops are called with bus_lock held and may sleep (they run in process
+ * context only). Addresses are Wishbone byte addresses from aes67_regs.h. The
+ * burst ops move `n` consecutive 32-bit words, one eth_buf byte per word. */
+struct aes67_bus_ops {
+	const char *name;
+	int (*read)(struct aes67_priv *p, u32 addr, u32 *val);
+	int (*write)(struct aes67_priv *p, u32 addr, u32 val);
+	int (*read_burst)(struct aes67_priv *p, u32 addr, u8 *bytes, unsigned int n);
+	int (*write_burst)(struct aes67_priv *p, u32 addr, const u8 *bytes, unsigned int n);
+};
+
 /* --- Driver private state ------------------------------------------------- */
 struct aes67_priv {
-	struct spi_device   *spi;
+	struct device       *dev;
+	const struct aes67_bus_ops *ops;
 	struct net_device   *netdev;
+
+	/* spibone backend */
+	struct spi_device   *spi;
+	u8 *spi_tx;      /* DMA-safe scratch for SPI burst transfers */
+	u8 *spi_rx;
+
+	/* pcie backend */
+	void __iomem        *bar;
+	void                *pcm;    /* struct aes67_pcm (aes67_pcm.c), if built */
 
 	/* Serialises every Wishbone access: netdev RX/TX bursts, PHC ops, and
 	 * the /dev/aes67ctl peek/poke. The whole bus has a single owner. */
 	struct mutex         bus_lock;
 
-	/* All bus I/O runs in process context (SPI sleeps): an ordered wq drains
-	 * the software TX queue and the poll fallback; a threaded IRQ drains RX. */
+	/* All bus I/O runs in process context: an ordered wq drains the software
+	 * TX queue and the poll fallback; a threaded IRQ drains RX. */
 	struct workqueue_struct *wq;
 	struct sk_buff_head      txq;
 	struct work_struct       tx_work;
 	struct delayed_work      poll_work;
-	int                      irq;
+	int                      irq;        /* netdev-owned IRQ (spibone); 0 = none */
+	bool                     irq_external; /* bus backend delivers RX events itself */
+	unsigned int             poll_ms;    /* RX poll interval (backstop) */
 
 	/* Scratch buffer for one RX frame (payload + FCS + timestamp trailer). */
 	u8 rx_buf[AES67_MAX_FRAME + AES67_FCS_LEN + AES67_RX_TS_TRAILER_LEN];
-
-	/* DMA-safe scratch for SPI burst transfers (devm_kmalloc'd, not embedded
-	 * here so they never land in vmalloc'd netdev priv memory). */
-	u8 *spi_tx;
-	u8 *spi_rx;
 
 	/* PHC */
 	struct ptp_clock      *ptp_clock;
@@ -99,16 +128,12 @@ struct aes67_priv {
 };
 
 /* --- Bus layer (aes67_bus.c) ---------------------------------------------- *
- * The __ variants assume bus_lock is held (for multi-word sequences); the
- * plain variants take it for a single transaction. */
+ * The _locked variants assume bus_lock is held (for multi-word sequences); the
+ * plain variants take it for a single transaction. They dispatch to p->ops. */
 int  aes67_wb_read_locked(struct aes67_priv *p, u32 addr, u32 *val);
 int  aes67_wb_write_locked(struct aes67_priv *p, u32 addr, u32 val);
 int  aes67_wb_read(struct aes67_priv *p, u32 addr, u32 *val);
 int  aes67_wb_write(struct aes67_priv *p, u32 addr, u32 val);
-
-/* Burst variants for the frame hot paths (bus_lock held). Each moves `n`
- * consecutive 32-bit words (eth_buf stores one byte per word) in a single SPI
- * transfer via the spibone burst commands, chunked to the per-device scratch. */
 int  aes67_wb_write_burst_locked(struct aes67_priv *p, u32 addr,
 				 const u8 *bytes, unsigned int n);
 int  aes67_wb_read_burst_locked(struct aes67_priv *p, u32 addr,
@@ -116,6 +141,46 @@ int  aes67_wb_read_burst_locked(struct aes67_priv *p, u32 addr,
 
 int  aes67_ctl_register(struct aes67_priv *p);
 void aes67_ctl_unregister(struct aes67_priv *p);
+
+/* --- Core (aes67_eth.c) --------------------------------------------------- *
+ * Backends allocate the netdev + priv with aes67_alloc(), fill in dev/ops/irq
+ * (and their own fields), then call aes67_core_probe(). */
+struct aes67_priv *aes67_alloc(struct device *dev);
+void aes67_free(struct aes67_priv *p);
+int  aes67_core_probe(struct aes67_priv *p);
+void aes67_core_remove(struct aes67_priv *p);
+/* Drain pending RX frames + refresh carrier. Process context; used by
+ * backends that receive the eth_buf interrupt themselves. */
+void aes67_netdev_service(struct aes67_priv *p);
+
+/* --- Backends ------------------------------------------------------------- */
+#if IS_ENABLED(CONFIG_SPI)
+int  aes67_spi_register(void);
+void aes67_spi_unregister(void);
+#else
+static inline int aes67_spi_register(void) { return 0; }
+static inline void aes67_spi_unregister(void) { }
+#endif
+
+#if IS_ENABLED(CONFIG_PCI)
+int  aes67_pci_register(void);
+void aes67_pci_unregister(void);
+#else
+static inline int aes67_pci_register(void) { return 0; }
+static inline void aes67_pci_unregister(void) { }
+#endif
+
+/* --- ALSA PCM on the PCIe audio DMA engine (aes67_pcm.c) ------------------ */
+#if IS_ENABLED(CONFIG_SND_PCM)
+int  aes67_pcm_register(struct aes67_priv *p);
+void aes67_pcm_unregister(struct aes67_priv *p);
+/* Called from the PCIe hard IRQ handler with the W1C status bits. */
+void aes67_pcm_irq(struct aes67_priv *p, u32 status);
+#else
+static inline int aes67_pcm_register(struct aes67_priv *p) { return 0; }
+static inline void aes67_pcm_unregister(struct aes67_priv *p) { }
+static inline void aes67_pcm_irq(struct aes67_priv *p, u32 status) { }
+#endif
 
 /* --- PHC (aes67_phc.c) ---------------------------------------------------- */
 int  aes67_phc_register(struct aes67_priv *p);

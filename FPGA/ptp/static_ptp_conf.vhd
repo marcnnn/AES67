@@ -47,7 +47,7 @@ begin
         servo_unlock_threshold_ns_o  <= (to_unsigned(5000, 32));
         servo_lock_count_threshold_o <= (to_unsigned(24, 8));
         parser_delay_asymmetry_ns_o      <=
-            (to_signed(DELAY_ASYMMETRY_NS_1G,   32)) when MII_TYPE = RGMII
+            (to_signed(DELAY_ASYMMETRY_NS_1G,   32)) when MII_TYPE = RGMII or MII_TYPE = GMII
        else (to_signed(DELAY_ASYMMETRY_NS_100M, 32));
 
 

@@ -1,28 +1,31 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * AES67 FPGA Ethernet driver — carries the FPGA eth_buf control-plane datapath
- * as a Linux net_device with hardware PTP timestamping, paired with the PHC in
- * aes67_phc.c so stock ptp4l can run on top.
+ * AES67 FPGA Ethernet driver core — carries the FPGA eth_buf control-plane
+ * datapath as a Linux net_device with hardware PTP timestamping, paired with
+ * the PHC in aes67_phc.c so stock ptp4l can run on top. Bus backends
+ * (aes67_spi.c, aes67_pci.c) probe the device and hand it to this core.
  *
  * SPI transfers sleep, so (unlike a DMA NIC) none of the bus work may run in the
  * atomic ndo_start_xmit / softirq NAPI context. Following the enc28j60/ks8851
  * model, all bus I/O happens in process context: a threaded IRQ (or a poll
  * delayed-work fallback) drains RX, and an ordered workqueue drains a software
  * TX queue. bus_lock (in the bus layer) serialises everything onto the one link.
+ * The PCIe backend keeps the same model (MMIO does not sleep, but the shared
+ * bus_lock is a mutex) and delivers its RX interrupt through
+ * aes67_netdev_service().
  */
 #include <linux/etherdevice.h>
 #include <linux/ethtool.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/net_tstamp.h>
-#include <linux/of.h>
 #include <linux/workqueue.h>
 
 #include "aes67_eth.h"
 
 static unsigned int poll_ms = 1;
 module_param(poll_ms, uint, 0644);
-MODULE_PARM_DESC(poll_ms, "RX poll interval (ms) when no IRQ is wired");
+MODULE_PARM_DESC(poll_ms, "RX poll interval (ms) when no IRQ is wired (spibone)");
 
 static bool rx_ts = true;
 module_param(rx_ts, bool, 0644);
@@ -271,6 +274,12 @@ static void aes67_service(struct aes67_priv *p)
 	}
 }
 
+void aes67_netdev_service(struct aes67_priv *p)
+{
+	if (netif_running(p->netdev))
+		aes67_service(p);
+}
+
 static irqreturn_t aes67_irq_thread(int irq, void *dev_id)
 {
 	aes67_service(dev_id);
@@ -285,7 +294,7 @@ static void aes67_poll_work(struct work_struct *work)
 	aes67_service(p);
 	if (netif_running(p->netdev))
 		queue_delayed_work(p->wq, &p->poll_work,
-				   msecs_to_jiffies(poll_ms));
+				   msecs_to_jiffies(p->poll_ms));
 }
 
 /* --- netdev ops ----------------------------------------------------------- */
@@ -300,7 +309,7 @@ static int aes67_open(struct net_device *ndev)
 	/* Enable the eth_buf RX-ready event (drives the IRQ line). */
 	aes67_wb_write(p, AES67_REG_ETH_BUF_EV_ENABLE, AES67_EV_RX_READY);
 
-	if (p->irq > 0) {
+	if (p->irq > 0 && !p->irq_external) {
 		ret = request_threaded_irq(p->irq, NULL, aes67_irq_thread,
 					   IRQF_ONESHOT, ndev->name, p);
 		if (ret) {
@@ -327,7 +336,7 @@ static int aes67_stop(struct net_device *ndev)
 
 	netif_stop_queue(ndev);
 
-	if (p->irq > 0)
+	if (p->irq > 0 && !p->irq_external)
 		free_irq(p->irq, p);
 	cancel_delayed_work_sync(&p->poll_work);
 	cancel_work_sync(&p->tx_work);
@@ -441,47 +450,49 @@ static const struct ethtool_ops aes67_ethtool_ops = {
 
 /* --- probe / remove ------------------------------------------------------- */
 
-static int aes67_probe(struct spi_device *spi)
+struct aes67_priv *aes67_alloc(struct device *dev)
 {
 	struct net_device *ndev;
 	struct aes67_priv *p;
-	u32 lo, hi;
-	int ret;
 
 	ndev = alloc_etherdev(sizeof(*p));
 	if (!ndev)
-		return -ENOMEM;
-	SET_NETDEV_DEV(ndev, &spi->dev);
+		return NULL;
+	SET_NETDEV_DEV(ndev, dev);
 
 	p = netdev_priv(ndev);
-	p->spi = spi;
+	p->dev = dev;
 	p->netdev = ndev;
-	p->irq = spi->irq;
+	p->poll_ms = poll_ms;
 	mutex_init(&p->bus_lock);
 	spin_lock_init(&p->tx_ts_lock);
 	skb_queue_head_init(&p->txq);
 	INIT_WORK(&p->tx_work, aes67_tx_work);
 	INIT_DELAYED_WORK(&p->poll_work, aes67_poll_work);
 
-	p->wq = alloc_ordered_workqueue("aes67_%s", 0, dev_name(&spi->dev));
-	if (!p->wq) {
-		ret = -ENOMEM;
-		goto err_free;
-	}
-
-	/* DMA-safe scratch for SPI burst transfers (auto-freed on driver detach). */
-	p->spi_tx = devm_kmalloc(&spi->dev, AES67_BURST_BUF, GFP_KERNEL);
-	p->spi_rx = devm_kmalloc(&spi->dev, AES67_BURST_BUF, GFP_KERNEL);
-	if (!p->spi_tx || !p->spi_rx) {
-		ret = -ENOMEM;
-		goto err_wq;
-	}
-
 	ndev->netdev_ops  = &aes67_netdev_ops;
 	ndev->ethtool_ops = &aes67_ethtool_ops;
 	ndev->watchdog_timeo = msecs_to_jiffies(5000);
+	return p;
+}
 
-	spi_set_drvdata(spi, p);
+void aes67_free(struct aes67_priv *p)
+{
+	free_netdev(p->netdev);
+}
+
+int aes67_core_probe(struct aes67_priv *p)
+{
+	struct net_device *ndev = p->netdev;
+	u32 lo, hi;
+	int ret;
+
+	if (!p->ops || !p->dev)
+		return -EINVAL;
+
+	p->wq = alloc_ordered_workqueue("aes67_%s", 0, dev_name(p->dev));
+	if (!p->wq)
+		return -ENOMEM;
 
 	/* Seed the MAC from the FPGA (set by a prior boot/daemon) if non-zero,
 	 * otherwise assign a random one and program it back in aes67_open(). */
@@ -500,25 +511,25 @@ static int aes67_probe(struct spi_device *spi)
 
 	ret = aes67_phc_register(p);
 	if (ret) {
-		dev_err(&spi->dev, "PHC register failed: %d\n", ret);
+		dev_err(p->dev, "PHC register failed: %d\n", ret);
 		goto err_wq;
 	}
 
 	ret = aes67_ctl_register(p);
 	if (ret) {
-		dev_err(&spi->dev, "control device register failed: %d\n", ret);
+		dev_err(p->dev, "control device register failed: %d\n", ret);
 		goto err_phc;
 	}
 
 	ret = register_netdev(ndev);
 	if (ret) {
-		dev_err(&spi->dev, "register_netdev failed: %d\n", ret);
+		dev_err(p->dev, "register_netdev failed: %d\n", ret);
 		goto err_ctl;
 	}
 
-	dev_info(&spi->dev, "AES67 netdev %s, PHC ptp%d, %s RX\n",
-		 ndev->name, ptp_clock_index(p->ptp_clock),
-		 p->irq > 0 ? "IRQ" : "polled");
+	dev_info(p->dev, "AES67 netdev %s over %s, PHC ptp%d, %s RX\n",
+		 ndev->name, p->ops->name, ptp_clock_index(p->ptp_clock),
+		 (p->irq > 0 || p->irq_external) ? "IRQ" : "polled");
 	return 0;
 
 err_ctl:
@@ -527,48 +538,42 @@ err_phc:
 	aes67_phc_unregister(p);
 err_wq:
 	destroy_workqueue(p->wq);
-err_free:
-	free_netdev(ndev);
+	p->wq = NULL;
 	return ret;
 }
 
-static void aes67_remove(struct spi_device *spi)
+void aes67_core_remove(struct aes67_priv *p)
 {
-	struct aes67_priv *p = spi_get_drvdata(spi);
-
 	unregister_netdev(p->netdev);
 	aes67_ctl_unregister(p);
 	aes67_phc_unregister(p);
 	destroy_workqueue(p->wq);
-	free_netdev(p->netdev);
+	p->wq = NULL;
 }
 
-static const struct of_device_id aes67_of_match[] = {
-	{ .compatible = "aes67,spibone" },
-	{ }
-};
-MODULE_DEVICE_TABLE(of, aes67_of_match);
+/* --- module --------------------------------------------------------------- */
 
-/* The SPI core derives the modalias from the DT compatible by stripping the
- * vendor prefix ("aes67,spibone" -> "spibone"), so the id_table entry must be
- * named "spibone" to match (otherwise: "has no spi_device_id" warning). */
-static const struct spi_device_id aes67_spi_ids[] = {
-	{ "spibone", 0 },
-	{ }
-};
-MODULE_DEVICE_TABLE(spi, aes67_spi_ids);
+static int __init aes67_init(void)
+{
+	int ret;
 
-static struct spi_driver aes67_spi_driver = {
-	.driver = {
-		.name = "aes67_eth",
-		.of_match_table = aes67_of_match,
-	},
-	.id_table = aes67_spi_ids,
-	.probe = aes67_probe,
-	.remove = aes67_remove,
-};
-module_spi_driver(aes67_spi_driver);
+	ret = aes67_spi_register();
+	if (ret)
+		return ret;
+	ret = aes67_pci_register();
+	if (ret)
+		aes67_spi_unregister();
+	return ret;
+}
+module_init(aes67_init);
 
-MODULE_DESCRIPTION("AES67 FPGA Ethernet + PHC driver");
+static void __exit aes67_exit(void)
+{
+	aes67_pci_unregister();
+	aes67_spi_unregister();
+}
+module_exit(aes67_exit);
+
+MODULE_DESCRIPTION("AES67 FPGA Ethernet + PHC (+ PCIe sound card) driver");
 MODULE_AUTHOR("AES67 project");
 MODULE_LICENSE("GPL");

@@ -133,6 +133,7 @@ The data-plane logic is identical regardless of who drives it; only the **Wishbo
 | **Integrated softcore** | `cyclone10` / `cyc1000` / `gowin` (`LITEX_HRAM` / `LITEX_SDRAM`) | On-FPGA VexRiscv + Zephyr | LiteX CSR over Wishbone | Self-contained single-chip system; SoC boots from SPI flash. |
 | **External MCU (Zephyr)** | `spibone` (`LITEX_SPIBONE`) | ESP32-S3 (same Zephyr firmware) | SPI → Wishbone | Active target; the SPI driver still needs porting from the old `spictrl` byte protocol to `spibone`. |
 | **External Linux host** | `aes67_bridge`, driven over `spibone` (FPGA top built with `PTP_IN_SOFTWARE = true`) | Linux (e.g. Raspberry Pi) | SPI→Wishbone via `aes67_eth.ko` | The `aes67_eth` kernel driver provides `net_device` + PHC (stock `ptp4l` disciplines the wallclock) and owns the bus; the Rust `config_tool` stack runs on top of it (daemon, CLI, web, discovery, TAP bridge). |
+| **PCIe sound card** | `aes67_bridge` (`--family xilinx`), driven by the board top's PCIe→AXI→Wishbone path (`PTP_IN_SOFTWARE = true`) | Linux PC (Alibaba KU3P PCIe card) | BAR0 MMIO via `aes67_eth.ko` (PCIe backend) | Same kernel driver and `config_tool` stack; the card additionally shows up as an ALSA sound card fed by a bus-mastering DMA engine ([FPGA/pcie/](FPGA/pcie/), [boards/xilinx/alibaba_ku3p](FPGA/boards/xilinx/alibaba_ku3p/)). |
 
 > For bring-up/debug, `config_tool` can also open a `spibone`/`uartbone` bridge **directly** (`aes67cfg --spi`/`--uart`) without the kernel driver — but the full Linux control plane (with `ptp4l` hardware PTP) runs through `aes67_eth.ko`, the single Wishbone master.
 >
@@ -154,7 +155,7 @@ All time-critical audio and timing logic lives in [FPGA/](FPGA/). New logic is V
 |--------|------|-------------|
 | Ethernet MAC | [FPGA/FPGA_Ethernet/](FPGA/FPGA_Ethernet/) | Fork of the YOL MAC with start-of-frame timestamp output (git submodule) |
 | RMII/SMII bridge | [FPGA/mii_rmii/](FPGA/mii_rmii/) | RMII↔MII glue for 100 Mbit PHYs (git submodule) |
-| MII converters | [FPGA/mii_converters.vhd](FPGA/mii_converters.vhd) | MII width/type adaptation between PHY and MAC |
+| MII converters | [FPGA/mii_converters.vhd](FPGA/mii_converters.vhd) | MII width/type adaptation between PHY and MAC (RMII, MII, RGMII, or GMII pass-through from an on-chip PCS/PMA) |
 | MII timestamp | [FPGA/ethernet_timestamp_mii.vhd](FPGA/ethernet_timestamp_mii.vhd) | Latches the 48b:32b wallclock at the SOF delimiter |
 | TX arbiter | [FPGA/eth_tx_arbiter.vhd](FPGA/eth_tx_arbiter.vhd) | Arbitrates PTP / audio / control-plane egress onto the MAC |
 | Packet aggregator | [FPGA/ethernet_packet_aggregator.vhd](FPGA/ethernet_packet_aggregator.vhd) | Assembles outgoing frames |
@@ -200,9 +201,9 @@ The core is parameterised through the generics on [aes67_top.vhd](FPGA/aes67_top
 
 | Generic | Typical default | Purpose |
 |---------|-----------------|---------|
-| `SOC_TYPE` | `"LITEX_HRAM"` | Control-plane core: `LITEX_HRAM`, `LITEX_SDRAM`, `LITEX_SPIBONE`, `LITEX_UARTBONE` |
-| `platform` | `"ALTERA"` | `"ALTERA"` or `"GOWIN"` vendor glue |
-| `ETHERNET_TYPE` / `MII_WIDTH` | `"RMII"` / `2` | PHY interface (`RMII` 100 Mbit or `RGMII` Gigabit) and MII data width |
+| `SOC_TYPE` | `"LITEX_HRAM"` | Control-plane core: `LITEX_HRAM`, `LITEX_SDRAM`, `LITEX_SPIBONE`, `LITEX_UARTBONE`, `PCIE_BRIDGE` (board top supplies the master) |
+| `platform` | `"ALTERA"` | `ALTERA`, `GOWIN`, `LATTICE` or `XILINX` vendor glue (PLL/MMCM, IO) |
+| `ETHERNET_TYPE` / `MII_WIDTH` | `"RMII"` / `2` | PHY interface (`RMII` 100 Mbit, `RGMII` Gigabit, or `GMII` from an on-chip SFP PCS/PMA) and MII data width |
 | `SYS_CLK_NS_PER_TICK` / `MII_CLK_NS_PER_TICK` | `8` / `20` | System (125 MHz) and MII clock periods — keep in sync with the actual clocks |
 | `TX_MAX_STREAMS` / `RX_MAX_STREAMS` | `8` / `8` | Maximum concurrent TX / RX RTP streams |
 | `TX_CHANNELS` / `RX_CHANNELS` | `16` / `16` | Audio channel count (×2 for I2S, ×8 for TDM8) |
@@ -211,7 +212,7 @@ The core is parameterised through the generics on [aes67_top.vhd](FPGA/aes67_top
 | `RX_SAMPLE_BUFFER_DEPTH` | `256` | RX playout buffer depth (latency vs. jitter tolerance) |
 | `AUDIO_TX/RX_TDM_CHANNELS` / `..._TDM_INPUTS/OUTPUTS` | `8` / `1–2` | TDM lane width and number of TDM data lines per direction |
 | `TDM_I2S_MODE` / `TDM_BCLK_MULT` / `TDM_FSCLK_50DUTY` | `false` / `256` / `false` | I2S framing mode, BCLK multiplier, 50 %-duty frame sync |
-| `AUDIO_TX/RX_USE_PARALLEL_INTERFACE` | `false` | `false` = integrates tdm mux/demux `true` exposes raw sample values |
+| `AUDIO_TX/RX_USE_PARALLEL_INTERFACE` | `false` | `false` = integrates tdm mux/demux `true` exposes raw sample values (used by the PCIe DMA engine) |
 | `USE_EXTERNAL_PLL` | `true` | `true` = drive audio clocks from the external Si5351A; `false` = use the on-chip NCO-generated clocks directly |
 | `ENABLE_METERING` | `true` | Per-channel signal/clip metering; set `false` to drop it and save logic |
 | `STATIC_PTP_CONF` | `true` | `true` = compile-time PTP servo/parser config; `false` = runtime-tunable from the control plane |
@@ -326,6 +327,10 @@ ptp4l -H -i eth0 -m  # hardware timestamping, disciplines the FPGA wallclock
 
 `aes67_regs.h` is generated from the LiteX `csr.csv` (`make regs CSV=…`) so register addresses track the gateware. The same software-PTP idea also runs on the **integrated softcore**: the Zephyr firmware always contains both PTP services (`CONFIG_PTP` + the [ptp_clock_aes67.c](soc_firmware/app/drivers/eth_litex/ptp_clock_aes67.c) PHC driver alongside the FPGA-BMC path) and picks one at boot from the gateware's static build configuration (`system_cfg` CSRs) — `PTP_IN_SOFTWARE` bitstreams get the Zephyr IEEE 1588 stack, hardware-PTP bitstreams get the FPGA engine.
 
+### PCIe sound card backend
+
+The same module has a PCIe backend ([aes67_pci.c](driver/aes67_eth/aes67_pci.c)) for FPGA cards whose board top exposes the `aes67_bridge` window in a PCI BAR. On the [Alibaba KU3P card](FPGA/boards/xilinx/alibaba_ku3p/) BAR0 holds the Wishbone window (byte address `0x90000000 + offset`, so the generated `aes67_regs.h` is used unchanged), the registers of a bus-mastering **audio DMA engine** ([FPGA/pcie/pcie_audio_dma.vhd](FPGA/pcie/pcie_audio_dma.vhd)) and a board/IRQ control block ([FPGA/pcie/pcie_ctrl_regs.vhd](FPGA/pcie/pcie_ctrl_regs.vhd)). The driver registers an **ALSA card** ([aes67_pcm.c](driver/aes67_eth/aes67_pcm.c)): the DMA engine streams ALSA's ring buffers straight into/out of the data plane's parallel sample registers at the PTP-derived media clock, so `aplay`/`arecord`/JACK/PipeWire see a normal S32_LE 48 kHz multichannel sound card whose channels are AES67 TX/RX channels. `ptp4l`, `aes67d`, `aes67cfg` and `aes67web` run exactly as on the Raspberry Pi setup.
+
 ---
 
 ## Firmware — Integrated Softcore (Zephyr)
@@ -375,8 +380,9 @@ Targets are at various maturity levels — the build matrix is still being shake
 | CYC1000 (`trenz_cyc1000`) | 10CL025YU256C8G | Integrated softcore / External | SDRAM | Working |
 | Lattice (`boards/lattice`) | Lattice | Integrated softcore / CPU-less bridge | — | New / experimental |
 | Tang Primer 20K (Gowin) | Gowin GW2A-18C | Integrated softcore | DDR3 | Experimental (Gowin EDA Ethernet clock-tree issues) |
+| Alibaba AS02MC04 PCIe card (`boards/xilinx/alibaba_ku3p`) | Xilinx XCKU3P-FFVB676 | External Linux host over PCIe (+ ALSA sound card) | none (host DMA) | New / untested on hardware — see the [board README](FPGA/boards/xilinx/alibaba_ku3p/README.md) |
 
-FPGA board projects/pinouts live under [FPGA/boards/](FPGA/boards/) (Altera / Lattice / Gowin), each with its own `top_*.vhd` wrapping `soc_top`; Zephyr board configs under [soc_firmware/app/boards/](soc_firmware/app/boards/).
+FPGA board projects/pinouts live under [FPGA/boards/](FPGA/boards/) (Altera / Lattice / Gowin / Xilinx), each with its own `top_*.vhd` wrapping `soc_top` (or `wb_bridge_top` plus a PCIe master on the Xilinx card); Zephyr board configs under [soc_firmware/app/boards/](soc_firmware/app/boards/).
 
 ---
 
@@ -394,11 +400,14 @@ source soc_firmware/.venv/bin/activate
 python litex_soc/generate.py --target aes67_bridge   # AES67 register block + csr.csv
 python litex_soc/generate.py --target cyclone10      # integrated VexRiscv SoC
 python litex_soc/generate.py --target spibone        # (or uartbone) CPU-less host bridge
+python litex_soc/generate.py --target aes67_bridge --family xilinx   # bridge for the Xilinx PCIe card
 ```
 Outputs land in `litex_soc/build/<target>/`. Regenerate after editing the `aes67_soc` package; the generated `csr.csv` is what every host (firmware, `config_tool`, kernel driver) resolves register names against.
 
 ### FPGA
 Open the per-board Quartus project under [FPGA/boards/](FPGA/boards/) (e.g. [FPGA/boards/altera/c10_evalkit/FPGA.qpf](FPGA/boards/altera/c10_evalkit/FPGA.qpf)) in Intel Quartus Prime 25.1 (primary device `10CL025YU256I7G`), or the Gowin/Lattice flow for those boards. Pick the control-plane core via the `SOC_TYPE` generic on `soc_top` (`LITEX_HRAM` / `LITEX_SDRAM` / `LITEX_SPIBONE` / `LITEX_UARTBONE`).
+
+For the Alibaba KU3P PCIe card run the Vivado script: `cd FPGA/boards/xilinx/alibaba_ku3p && vivado -mode batch -source build.tcl` (generates the XDMA and PCS/PMA IP cores, builds `build/aes67_ku3p.bit` and a QSPI `.mcs`); details in its [README](FPGA/boards/xilinx/alibaba_ku3p/README.md).
 
 ### Firmware (Zephyr — integrated softcore)
 ```bash

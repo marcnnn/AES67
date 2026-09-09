@@ -52,6 +52,9 @@ generic (
 		
 		mcu_clk_o : OUT std_logic;
         mcu_clk_90_o : OUT std_logic;
+        -- 125 MHz data-plane clock (the domain of the audio clocks and the
+        -- parallel sample registers), for board tops that add logic on it.
+        sys_clk_o : OUT std_logic;
         mcu_irq_o : OUT STD_LOGIC;
 
 
@@ -160,6 +163,7 @@ aes67_wb_bridge_inst: entity work.aes67_wb_bridge
       locked_o => sysclk_pll_locked
   );
   mcu_clk_o <= mcu_clk;
+  sys_clk_o <= sys_clk_125MHz;
   mii_converters_inst: entity work.mii_converters
    generic map(
       MII_WIDTH => syscfg.PHY_CONFIG.NETWORK_CONFIG.MII_WIDTH,
