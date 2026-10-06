@@ -61,6 +61,10 @@ set_location_assignment PIN_39 -to spictrl_cs
 set_location_assignment PIN_37 -to spictrl_irq
 set_location_assignment PIN_43 -to spictrl_miso
 set_location_assignment PIN_40 -to spictrl_mosi
+set_location_assignment PIN_198 -to esp_bclk
+set_location_assignment PIN_199 -to esp_fsclk
+set_location_assignment PIN_201 -to esp_din
+set_location_assignment PIN_203 -to esp_dout
 set_location_assignment PIN_89 -to c2_resetn
 set_location_assignment PIN_35 -to mdc
 set_location_assignment PIN_34 -to mdio
@@ -135,6 +139,8 @@ set_location_assignment PIN_192 -to dbg_o[2]
 set_location_assignment PIN_193 -to dbg_o[1]
 set_location_assignment PIN_195 -to dbg_o[0]
 set_location_assignment PIN_63 -to mclk
+set_location_assignment PIN_64 -to vcxo_pdout_a
+set_location_assignment PIN_57 -to vcxo_pdout_b
 set_location_assignment PIN_12 -to tdm_out[0]
 set_location_assignment PIN_13 -to tdm_out[1]
 set_location_assignment PIN_15 -to tdm_out[2]

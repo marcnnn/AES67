@@ -1,13 +1,31 @@
 # Local Zephyr patches (alright to call it "AI slop")
 
-Zephyr is pinned in `soc_firmware/app/west-manifest/west.yml` to a main
-snapshot (see the `revision:` comment there). These patches are applied on
-top; the canonical branch in `external/zephyr` is `aes67/main-20260703`.
+Zephyr comes from our fork, https://github.com/malarisch/zephyr. Branch
+`aes67` there is an upstream `main` snapshot with the patch series below
+already applied (rebased and force-pushed on each upstream bump).
+`soc_firmware/app/west-manifest/west.yml` follows that branch
+(`revision: aes67`) — the fork exists only for this project, so its tip
+is always the intended state. The tree is also the git submodule
+`external/zephyr`, whose gitlink records which commit a given AES67
+revision was built against (`git add external/zephyr` after `west update`
+moved it; a stale gitlink is harmless, west checks out the tip anyway).
+West still owns the workspace and fetches the imported modules. The
+commits themselves live only on the fork — this file is the changelog
+(`git log origin/main..aes67`).
 
-After a fresh clone / `west update`, re-apply with:
+Current base: upstream main 042104ba7e (2026-09-09).
 
+Rebasing onto a newer upstream:
+
+    # sync the fork's main with upstream on GitHub first ("Sync fork")
     cd external/zephyr
-    git checkout aes67/main-20260703   # or: git am ../../soc_firmware/zephyr-patches/*.patch
+    git fetch origin main                      # origin = malarisch/zephyr
+    git checkout aes67
+    git rebase origin/main            # drop anything merged upstream meanwhile
+    # build all targets + twister, then:
+    git push --force-with-lease origin aes67
+    # record the new tip: `git add external/zephyr` from the repo root,
+    # then update "Current base" here
 
 - 0001 spi_litex: local behaviour change (SPI_CS_ACTIVE_HIGH deasserts CS
   during transfer for SD-card init clocking; SPI_LOCK_ON ignored).
@@ -18,24 +36,18 @@ After a fresh clone / `west update`, re-apply with:
   saturating wallclock rate correction (±524287 ppb) pins at the clamp
   and pi_drift winds up by millions of ppb after the boot-time step —
   candidate for upstream submission.
-- 0004 ptp announce: header logMessageInterval carried logSyncInterval
-  instead of logAnnounceInterval. Receivers size the foreign-master
-  qualification window from it (4 × announce interval), so with AES67
-  intervals (sync -3, announce 1) the clock never qualified anywhere:
-  linuxptp saw but never selected it, Zephyr peers showed an all-zero
-  foreign record and stayed LISTENING — candidate for upstream submission.
-- 0005 ptp step: flush in-flight Delay_Reqs on a clock step. The epoch
+- 0004 ptp step: flush in-flight Delay_Reqs on a clock step. The epoch
   reset alone leaves a pre-step egress timestamp in flight; the first
   mean_delay of the new epoch absorbs the step size and the next Sync
   steps right back — a self-sustaining ±step limit cycle (observed at
   ±110 ms / 1 Hz) — candidate for upstream submission.
-- 0006 ptp filter: linuxptp-style moving-median prefilters on both servo
+- 0005 ptp filter: linuxptp-style moving-median prefilters on both servo
   inputs — E2E path delay (CONFIG_PTP_PATH_DELAY_FILTER_LENGTH, default 9)
   and offset (CONFIG_PTP_OFFSET_FILTER_LENGTH, default 5, applied before
   the step check so a single bad timestamp can't step the clock). Filters
   reset on clock step / servo reset; length 1 disables — candidate for
   upstream submission.
-- 0007 ptp servo: adaptive linear-regression servo (port of linuxptp's
+- 0006 ptp servo: adaptive linear-regression servo (port of linuxptp's
   linreg.c) as Kconfig alternative to the PI controller
   (CONFIG_PTP_SERVO_LINREG; default stays CONFIG_PTP_SERVO_PI, whose
   KP/KI options now depend on it). Least-squares fit over 4–64 samples,
@@ -43,27 +55,33 @@ After a fresh clone / `west update`, re-apply with:
   averaging adapts to measurement noise. Stepping/outlier logic stays
   outside the servo; ptp_clock_sync_interval() feeds the
   timeTransmitter's Sync interval to the phase-correction term. Fed the
-  RAW offset, not the 0006 median — the median's ~2-sample group delay
+  RAW offset, not the 0005 median — the median's ~2-sample group delay
   in the loop drives linreg into a full-scale ±524287 ppb limit cycle
   (seen on HW, confirmed in sim); the median still guards step/outlier
   checks — candidate for upstream submission.
-- 0008 esp32s3: re-init esp_flash default chip after PSRAM init.
-- 0009 ptp servo: linreg samples weighted à la linuxptp tsproc
+- 0007 esp32s3 soc: re-init the esp_flash default chip after PSRAM init.
+  PSRAM timing tuning (octal @ 80 MHz) switches the shared MSPI core
+  clock 80→160 MHz after esp_flash_config() captured the old source
+  frequency — every SPI1 command transaction then runs at 160 MHz, all
+  esp_flash erases/writes fail the WEL check with ESP_ERR_NOT_FOUND
+  (261) while XIP keeps working. ESP-IDF inits the chip after PSRAM for
+  this reason — candidate for upstream submission.
+- 0008 ptp servo: linreg samples weighted à la linuxptp tsproc
   filter_weight (weight = filtered/raw path delay from current Sync +
   last Delay_Req) and DROPPED below weight 0.7 (max 8 in a row,
   starvation guard). Queuing delay is one-sided; without this the
   slightest cross traffic pulled the locked clock ~10 µs (weighting
   alone in sim: ~17 µs; with drop gate: ~35 ns) — candidate for
   upstream submission.
-- 0010 ptp msg: drop unparseable/foreign-version messages instead of
+- 0009 ptp msg: drop unparseable/foreign-version messages instead of
   faulting the port. Any post_recv error raised PTP_EVT_FAULT_DETECTED,
   so PTPv1 traffic (Dante shares 224.0.1.129:319/320) kept the port
   permanently FAULTY (err-log spam per packet); also a trivial remote
   DoS. Version now checked first, -EPROTONOSUPPORT at dbg level,
   parse errors → drop (linuxptp: EV_NONE) — candidate for upstream
   submission.
-- 0011 ptp servo: robust offset outlier gate + linreg phase-slew limit.
-  The 0009 delay-weight gate only catches queuing spikes (raw delay
+- 0010 ptp servo: robust offset outlier gate + linreg phase-slew limit.
+  The 0008 delay-weight gate only catches queuing spikes (raw delay
   rises); a corrupted timestamp that shifts the offset WITHOUT raising
   the delay passes it and poisons up to 64 linreg fits — observed on one
   board as periodic ~10 s bursts of ±200k ppb at 8 Hz sync while an
@@ -75,9 +93,9 @@ After a fresh clone / `west update`, re-apply with:
   conf: 2000) clamps the linreg intercept term for media-friendly
   bounded frequency excursions — candidate for upstream submission
   (gate part).
-- 0012 ptp step: acquisition phase trim via atomic phase jump. Offsets
+- 0011 ptp step: acquisition phase trim via atomic phase jump. Offsets
   below the 5 ms step threshold but far from zero were left to the
-  servo to slew out — minutes with the 2000 ppb media clamp from 0011.
+  servo to slew out — minutes with the 2000 ppb media clamp from 0010.
   Two observed cases: the coarse get/compute/set boot-epoch step ages by
   the SPI round-trip and lands ~800 µs off; a warm FPGA wallclock
   surviving an ESP32 reboot starts ~300–500 µs off with no step at all.
@@ -89,15 +107,7 @@ After a fresh clone / `west update`, re-apply with:
   step loop at 1 Hz, servo pinned at 0 ppb. Median-full gating keeps
   single corrupted timestamps from triggering bogus jumps — candidate
   for upstream submission.
-- 0008 esp32s3 soc: re-init the esp_flash default chip after PSRAM init.
-  PSRAM timing tuning (octal @ 80 MHz) switches the shared MSPI core
-  clock 80→160 MHz after esp_flash_config() captured the old source
-  frequency — every SPI1 command transaction then runs at 160 MHz, all
-  esp_flash erases/writes fail the WEL check with ESP_ERR_NOT_FOUND
-  (261) while XIP keeps working. ESP-IDF inits the chip after PSRAM for
-  this reason — candidate for upstream submission.
-
-- 0013 net_if: use a link-local IPv4 address as the last-resort source
+- 0012 net_if: use a link-local IPv4 address as the last-resort source
   address regardless of CONFIG_NET_IPV4_AUTO. The firmware configures its
   own 169.254.x.y fallback (MAC-derived, added by main.c) instead of using
   Zephyr's autoconf, because NET_IPV4_AUTO force-selects NET_IPV4_ACD and
@@ -112,7 +122,7 @@ After a fresh clone / `west update`, re-apply with:
   (mDNS, SAP, PTP) would go out from 0.0.0.0 — candidate for upstream
   submission.
 
-- 0014 ptp: marshal link events to the PTP thread. port_link_monitor()
+- 0013 ptp: marshal link events to the PTP thread. port_link_monitor()
   (net_mgmt thread) ran ptp_port_event_handle(FAULT_DETECTED) directly on
   link-down: port_disable() -> zsock_close() on the sockets the PTP thread
   was sleeping on in zsock_poll(-1) — freeing net_contexts still registered
@@ -124,17 +134,17 @@ After a fresh clone / `west update`, re-apply with:
   top of its loop, so sockets are only closed/reopened by their poller —
   candidate for upstream submission.
 
-- 0015 ptp: re-arm the acquisition trim (0012) when a full-median offset
+- 0014 ptp: re-arm the acquisition trim (0011) when a full-median offset
   parks beyond 100 us for 16 consecutive samples. Steady-state offsets of
   hundreds of us (drift across a FAULTY/link-down phase, GM wander, peer
   restart) sit below the 5 ms step threshold with no trim budget left, so
   only the 2000 ppb media-clamped slew remained: 0.5-1 ms took 4-8
   minutes (observed parked at ~500 us, ppb frequency-matched). Hysteresis
   10 us disarm / 100 us re-arm (both >> ~5 us median-refill drift) plus
-  the 16-sample streak keep the 0012 self-retrigger loop impossible —
+  the 16-sample streak keep the 0011 self-retrigger loop impossible —
   candidate for upstream submission.
 
-- 0016 ptp: CONFIG_PTP_APP_MANAGED_START — suppress the SYS_INIT start of
+- 0015 ptp: CONFIG_PTP_APP_MANAGED_START — suppress the SYS_INIT start of
   the PTP stack and expose ptp_start() instead. The firmware ships ONE
   binary for both PTP gateware modes, reads the FPGA's system_cfg CSRs at
   boot (on external MCUs the FPGA is configured long after SYS_INIT) and
@@ -142,7 +152,77 @@ After a fresh clone / `west update`, re-apply with:
   otherwise no PTP thread/sockets/traffic exist and the FPGA's hardware
   PTP engine owns the wire — candidate for upstream submission.
 
-Dropped since the v4.2.0 era (now upstream): uptime-based message aging
-(3ccd07b2), servo epoch reset after clock step, configurable PI servo gains
-(9803584), ingress-timestamp validity guards. (The phase-jump step came back
-as 0003 — upstream's epoch reset only steps above 1 s.)
+- 0016 spi_esp32: make CONFIG_SPI_ESP32_INTERRUPT actually interrupt-paced.
+  Upstream (incl. current main) forces the interrupt in transceive() and
+  runs the WHOLE transfer — including the per-chunk usr_is_done busy-wait —
+  inside the ISR: the thread never sleeps, the full wire time is burned
+  spinning in interrupt context (~40 % of the core at 10 MHz spibone load)
+  and each chunk blocks everything for its wire duration. Split
+  transfer into start/finish halves; the trans_done ISR finishes one chunk
+  and arms the next, the caller sleeps in spi_context_wait_for_completion
+  (timeout path quiesces + releases the PM lock). Polling mode and target
+  mode unchanged — candidate for upstream submission.
+
+- 0017 i2s_esp32: target (slave) mode module clock. The driver derived
+  MCLK from the frame clock (fs x 8 = 384 kHz at 48 kHz) instead of from
+  BCLK (bclk x 8, the ESP-IDF rule "module clock >= 8 x BCLK"), so a
+  slave receiving a 3.072 MHz BCLK sampled it with a 384 kHz clock and
+  never locked. Also: rx/tx_stop_transfer() dropped the pointer to the
+  block the DMA was working on without freeing it, so every DROP / STOP /
+  error path leaked one slab block per direction (the slab is empty after
+  a handful of restarts). Needed for the USB-audio experiment (ESP32-S3 as
+  I2S slave of the FPGA media clock) — candidate for upstream submission.
+
+- 0018 cache_esp32: treat NULL/zero-length ranges as no-ops. udc_dwc2 in
+  buffer-DMA mode syncs every net_buf before a transfer, including ZLPs
+  (data NULL, len 0); esp_cache_msync() rejects those with a logged
+  "null pointer" error on every packet, which floods the console —
+  candidate for upstream submission.
+
+- 0019 udc_dwc2: CONFIG_UDC_DWC2_RXFIFO_MAX_PERCENTAGE. The RxFIFO share
+  of the controller SPRAM was a hard-coded 25 %; on the ESP32-S3 (1 KB
+  SPRAM) that is 256 B, so any OUT packet above that — every UAC2
+  Full-Speed audio packet — is dropped by the core and isochronous OUT
+  completes empty on every frame while IN works. Made configurable
+  (default unchanged) — candidate for upstream submission. Also adds
+  CONFIG_UDC_DWC2_FIFO0_PACKETS (default 2 = unchanged): the EP0 TxFIFO
+  was hard-coded to two 64 B packets; with 1 the S3 budget (200 usable
+  words) fits RxFIFO 110 + EP0 16 + ISO IN 74 for 2 ch 24 bit duplex.
+  HW finding: the core drops an ISO OUT packet (DOEPINT.PktDrpSts) when
+  the RxFIFO is smaller than about MPS/4 + 1 + one EP0 packet + 1 words,
+  not just when it is smaller than the packet.
+- 0020 udc_dwc2: re-arm isochronous OUT endpoints from the ISR. The
+  driver used to arm the next queued OUT buffer from its thread after
+  every completion; whenever a cooperative thread (Zephyr's tx_tstamp at
+  K_PRIO_COOP(1), doing SPI on the ESP32) held the CPU for more than the
+  rest of the frame, the host's next packet hit a disabled endpoint and
+  was dropped (OUTTknEPdis + PktDrpSts, ~2 % loss). Completed ISO OUT
+  buffers now go through a k_fifo (priv->iso_out_done) to the thread,
+  and the ISR arms the next queued buffer immediately.
+- 0021 usbd_uac2: CONFIG_USBD_AUDIO2_QUEUE_DEPTH (default 2 = the old
+  fixed double-buffering). The class kept at most two transfers queued
+  per AudioStreaming interface; with the ISR re-arm above the queue must
+  survive several frames of class-thread latency, so the two bitmasks
+  became a per-interface counter and uac2_sof tops the queue up to the
+  configured depth (ESP32 build uses 4).
+
+Merged upstream (dropped from the series):
+- announce messages must advertise logAnnounceInterval (was 0004) —
+  upstream f939ffaa8f "ptp: put announce interval into announce
+  packages", in main since 2026-07-27.
+- From the v4.2.0 era: uptime-based message aging (3ccd07b2), servo
+  epoch reset after clock step, configurable PI servo gains (9803584),
+  ingress-timestamp validity guards. (The phase-jump step came back as
+  0003 — upstream's epoch reset only steps above 1 s.)
+
+Rebase notes (2026-09-09, 8edca5b8df → 042104ba7e):
+- 0001: `spi_config.slave` → `.peripheral` (inclusive-terminology rename).
+- 0013: upstream switched the link monitor to
+  NET_MGMT_REGISTER_EVENT_HANDLER, so `struct ptp_port.link_cb` is gone;
+  only `link_evt` remains.
+- 0016: merged with upstream 45b80b04da (wait for completion in
+  interrupt mode, `asynchronous` guard) — upstream still runs the whole
+  transfer in the ISR, so the split is still needed.
+- Firmware side: ETHERNET_PTP hw_caps flag removed (get_ptp_clock() is
+  the check now), SPI_DT_SPEC_GET lost its delay argument,
+  SPI_OP_MODE_MASTER → _CONTROLLER, FIXED_PARTITION_ID → PARTITION_ID.

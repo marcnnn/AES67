@@ -40,6 +40,9 @@ package system_cfg_pkg is
         USE_PARALLEL_INTERFACE : boolean;
         PARALLEL_BYTE_DEPTH : integer;
         MCLK_SPEED : audio_clock_speed;
+        MCLK_SOURCE : t_mclk_source;
+        -- MCLK_SRC_VCXO only: pin BCLK/LRCK clocked by the VCXO itself
+        VCXO_DOMAIN_CLOCKS : boolean;
         BCLK_SPEED : audio_clock_speed;
         RX_DA_CFG : t_audio_cfg;
         TX_AD_CFG : t_audio_cfg;
@@ -58,6 +61,11 @@ package system_cfg_pkg is
         ENABLE_METERING : boolean;
     end record;
     function system_cfg_to_vector (cfg : in t_global_system_cfg) return std_logic_vector;    
+    -- Same config with the MCLK taken from the board's VCXO instead of the
+    -- NCO, e.g. syscfg => with_vcxo_mclk(global_system_cfg_rn2io).
+    -- domain_clocks = true also clocks the pin BCLK/LRCK from the VCXO.
+    function with_vcxo_mclk (cfg : in t_global_system_cfg;
+                             domain_clocks : in boolean := false) return t_global_system_cfg;
     constant std_mii_cfg : t_network_config := (
         MII_TYPE => MII,
         MII_WIDTH => 4,
@@ -130,6 +138,13 @@ package system_cfg_pkg is
         TDM_PINS => 1,
         ADDA_CFG => i2s_adc_config
     );
+    constant two_i2s_inputs_bclkinv : t_audio_cfg := (
+        MAX_STREAMS => 2,
+        BUFFER_DEPTH => 64,
+        CHANNELS => 2,
+        TDM_PINS => 1,
+        ADDA_CFG => i2s_esp_config
+    );
     constant four_i2s_outputs : t_audio_cfg := (
         MAX_STREAMS => 8,
         BUFFER_DEPTH => 256,
@@ -179,14 +194,28 @@ package system_cfg_pkg is
 
     constant audio_config_lo : t_global_audio_cfg := (
         MCLK_SPEED => audio_clock_24_57,
+        MCLK_SOURCE => MCLK_SRC_NCO,
+        VCXO_DOMAIN_CLOCKS => false,
         BCLK_SPEED => audio_clock_03_07,
         USE_PARALLEL_INTERFACE => false,
         PARALLEL_BYTE_DEPTH => 3,
         RX_DA_CFG => four_i2s_outputs,
         TX_AD_CFG => disable_audio_path
     );
+    constant audio_config_2io : t_global_audio_cfg := (
+        MCLK_SPEED => audio_clock_24_57,
+        MCLK_SOURCE => MCLK_SRC_NCO,
+        VCXO_DOMAIN_CLOCKS => false,
+        BCLK_SPEED => audio_clock_03_07,
+        USE_PARALLEL_INTERFACE => false,
+        PARALLEL_BYTE_DEPTH => 3,
+        RX_DA_CFG => two_i2s_inputs_bclkinv,
+        TX_AD_CFG => two_i2s_inputs_bclkinv
+    );
     constant audio_config_mi : t_global_audio_cfg := (
         MCLK_SPEED => audio_clock_24_57,
+        MCLK_SOURCE => MCLK_SRC_NCO,
+        VCXO_DOMAIN_CLOCKS => false,
         BCLK_SPEED => audio_clock_03_07,
         USE_PARALLEL_INTERFACE => false,
         PARALLEL_BYTE_DEPTH => 3,
@@ -195,6 +224,8 @@ package system_cfg_pkg is
     );
     constant audio_config_cyc : t_global_audio_cfg := (
         MCLK_SPEED => audio_clock_24_57,
+        MCLK_SOURCE => MCLK_SRC_NCO,
+        VCXO_DOMAIN_CLOCKS => false,
         BCLK_SPEED => audio_clock_03_07,
         USE_PARALLEL_INTERFACE => false,
         PARALLEL_BYTE_DEPTH => 3,
@@ -219,6 +250,17 @@ package system_cfg_pkg is
         PLATFORM => ALTERA,
         PHY_CONFIG => std_lxt_cfg,
         AUDIO_CONFIG => audio_config_lo,
+        STATIC_PTP_CONFIG => true,
+        PTP_IN_SOFTWARE => true,
+        ENABLE_METERING => false,
+        PTP_MOVING_AVERAGE_DEPTH => 4
+    );
+    constant global_system_cfg_rn2io : t_global_system_cfg := (
+        CLK_IN_SPEED => 25,
+        SOC_TYPE => LITEX_SPIBONE,
+        PLATFORM => ALTERA,
+        PHY_CONFIG => std_lxt_cfg,
+        AUDIO_CONFIG => audio_config_2io,
         STATIC_PTP_CONFIG => true,
         PTP_IN_SOFTWARE => true,
         ENABLE_METERING => false,
@@ -275,6 +317,16 @@ package body system_cfg_pkg is
         end if;
     end function To_Std_Logic;
     
+    function with_vcxo_mclk (cfg : in t_global_system_cfg;
+                             domain_clocks : in boolean := false) return t_global_system_cfg is
+        variable r : t_global_system_cfg;
+    begin
+        r := cfg;
+        r.AUDIO_CONFIG.MCLK_SOURCE := MCLK_SRC_VCXO;
+        r.AUDIO_CONFIG.VCXO_DOMAIN_CLOCKS := domain_clocks;
+        return r;
+    end;
+
     function system_cfg_to_vector (cfg : in t_global_system_cfg) return std_logic_vector is    
         variable vector : std_logic_vector(71 downto 0);
     begin
